@@ -4,10 +4,10 @@ set -o errtrace
 IFS=$'\n\t'
 
 #############################################################################################
-# N8N Installation, Upgrade, Backup & Restore Manager
+# N8N Installation, Upgrade, Backup & Restore Manager (with Google Drive upload via rclone)
 # Author:      TheNguyen
 # Email:       thenguyen.ai.automation@gmail.com
-# Version:     2.0.0
+# Version:     2.1.0
 # Date:        2025-08-27
 #
 # Description:
@@ -27,12 +27,8 @@ IFS=$'\n\t'
 #       * Change detection snapshot to skip redundant backups (use -f to force)
 #       * Rolling 30-day Markdown summary (backup_summary.md)
 #       * Optional email notifications via Gmail SMTP (msmtp)
-#       * Restore from local archive (tar.gz) with health checks
-#
-# Notes:
-#   - This script relies on shared helpers in n8n_common.sh (logging, compose, health checks,
-#     env utilities, etc.). Keep n8n_common.sh in the same directory and source it here.
-#   - No cloud uploads: Google Drive/rclone support and related arguments have been removed.
+#       * Optional upload to Google Drive (or any rclone remote)
+#       * Restore from local archive or rclone remote path (remote:folder/file.tar.gz)
 #############################################################################################
 
 # Load common helpers
@@ -71,6 +67,10 @@ EMAIL_TO=""
 EMAIL_EXPLICIT=false
 EMAIL_SENT=false
 
+# rclone (Google Drive) – optional
+RCLONE_REMOTE=""   # e.g., gdrive-user:/n8n-backups  OR gdrive-user:
+RCLONE_FLAGS=(--transfers=4 --checkers=8 --retries=5 --low-level-retries=10 --contimeout=30s --timeout=5m --retries-sleep=10s)
+
 # Paths & context (set later)
 DEFAULT_N8N_DIR="/home/n8n"
 N8N_DIR=""
@@ -82,7 +82,12 @@ LOG_DIR=""
 DATE=""
 ACTION=""
 BACKUP_STATUS=""
+UPLOAD_STATUS=""
 BACKUP_FILE=""
+DRIVE_LINK=""
+
+# Retention
+DAYS_TO_KEEP=7
 
 # ------------------------------- Usage ---------------------------------------
 ################################################################################
@@ -119,9 +124,8 @@ Actions (choose exactly one):
         Perform a local backup (volumes + Postgres dump + configs)
         Skips if no changes since last snapshot unless -f is provided
 
-  -r, --restore <FILE>
-        Restore from a local backup archive (.tar.gz)
-        NOTE: remote/cloud restore has been removed
+  -r, --restore <FILE_OR_REMOTE>
+        Restore from local archive (.tar.gz) or rclone remote (e.g. gdrive:folder/file.tar.gz)
 
 General Options:
   -v, --version <N8N_VERSION>
@@ -136,16 +140,19 @@ General Options:
   -l, --log-level <LEVEL>
         DEBUG, INFO (default), WARN, ERROR
 
-Backup/Restore Email Notifications (via msmtp/Gmail):
+Backup/Restore Options:
   -e, --email <TO_ADDRESS>
-        Send notifications to this address (requires SMTP_USER/SMTP_PASS env)
+        Send email notifications (requires SMTP_USER/SMTP_PASS env)
 
   -n, --notify-on-success
-        Also send email on successful backup/restore
-        (By default, only failures trigger emails)
+        Also email on successful backup/restore (by default only failures email)
+
+  -s, --remote-name <RCLONE_REMOTE>
+        rclone remote root (e.g. gdrive-user or gdrive-user:/n8n-backups)
+        If set, uploads backup + checksum + backup_summary.md and prunes old remote files
 
   -f, --force
-        Backup: force backup even if no changes
+        Backup: force even if no changes
         Upgrade: allow downgrade or same-version redeploy
 
   -h, --help
@@ -155,8 +162,8 @@ Examples:
   $0 -a
   $0 -i n8n.example.com -m you@example.com
   $0 -u n8n.example.com -f -v 1.107.2
-  $0 -b -d /home/n8n -e ops@example.com --notify-on-success
-  $0 -r /home/n8n/backups/n8n_backup_1.107.2_2025-08-27_12-30-00.tar.gz
+  $0 -b -d /home/n8n -s gdrive-user:/n8n-backups -e ops@example.com --notify-on-success
+  $0 -r gdrive-user:/n8n-backups/n8n_backup_1.107.2_2025-08-27_12-30-00.tar.gz
 EOF
     exit 1
 }
@@ -336,7 +343,6 @@ prepare_compose_file() {
     fi
 
     validate_image_tag "$target_version" || { log ERROR "Image tag not found: $target_version"; exit 1; }
-
     upsert_env_var "N8N_IMAGE_TAG" "$target_version" "$env_file"
 
     # Rotate STRONG_PASSWORD if missing/default
@@ -379,8 +385,8 @@ install_docker() {
             curl -fsSL https://get.docker.com | sh
         fi
     fi
-    log INFO "Installing utilities (jq vim rsync tar msmtp dnsutils openssl)…"
-    apt-get install -y --no-install-recommends jq vim rsync tar msmtp dnsutils openssl
+    log INFO "Installing utilities (jq vim rsync tar msmtp dnsutils openssl rclone)…"
+    apt-get install -y --no-install-recommends jq vim rsync tar msmtp dnsutils openssl rclone
     command -v systemctl >/dev/null 2>&1 && systemctl enable --now docker || true
     local CURRENT_USER=${SUDO_USER:-$(whoami)}
     usermod -aG docker "$CURRENT_USER" || true
@@ -522,13 +528,14 @@ cleanup_n8n() {
 }
 
 # --------------------------- Backup/Restore section ---------------------------
-# Config
-DAYS_TO_KEEP=7
 
 ################################################################################
 # box_line()
 # Description:
 #   Print a left-aligned label (fixed width 22) and a value on one line.
+#
+# Returns:
+#   0 always.
 ################################################################################
 box_line() { printf "%-22s%s\n" "$1" "$2"; }
 
@@ -536,6 +543,9 @@ box_line() { printf "%-22s%s\n" "$1" "$2"; }
 # can_send_email()
 # Description:
 #   Check whether SMTP config is sufficient to send email.
+#
+# Returns:
+#   0 if ok; 1 otherwise.
 ################################################################################
 can_send_email() {
     [[ -n "$EMAIL_TO" && -n "$SMTP_USER" && -n "$SMTP_PASS" ]]
@@ -545,6 +555,9 @@ can_send_email() {
 # send_email()
 # Description:
 #   Send a multipart email via Gmail SMTP (msmtp), optional attachment.
+#
+# Returns:
+#   0 on success; non-zero if send fails.
 ################################################################################
 send_email() {
     local subject="$1"
@@ -594,6 +607,9 @@ send_email() {
 # handle_error_backup()
 # Description:
 #   Backup/restore ERR handler to write summary and notify.
+#
+# Returns:
+#   Exits 1.
 ################################################################################
 handle_error_backup() {
   write_summary "${ACTION:-Unknown}" "FAIL" || true
@@ -603,13 +619,6 @@ handle_error_backup() {
              "An error occurred. See attached log." "$attach" || true
   exit 1
 }
-
-################################################################################
-# usage_backup()
-# Description:
-#   Print compact backup/restore help (not used; integrated in main usage()).
-################################################################################
-usage_backup() { :; }
 
 ################################################################################
 # initialize_snapshot()
@@ -655,6 +664,9 @@ refresh_snapshot() {
 # is_system_changed()
 # Description:
 #   Determine if live data differs from the snapshot.
+#
+# Returns:
+#   0 if changed; 1 if no differences.
 ################################################################################
 is_system_changed() {
     local src dest diffs file vol
@@ -677,6 +689,79 @@ is_system_changed() {
         fi
     done
     return 1
+}
+
+################################################################################
+# get_google_drive_link()
+# Description:
+#   Produce Google Drive folder URL for the configured rclone remote.
+#
+# Behaviors:
+#   - Reads root_folder_id from `rclone config show <remote>`.
+#
+# Returns:
+#   Prints the URL or empty string.
+################################################################################
+get_google_drive_link() {
+    if [[ -z "$RCLONE_REMOTE" ]]; then
+        echo ""; return
+    fi
+    # Normalize remote name (strip path and colon for config show)
+    local remote_name remote_only
+    remote_only="${RCLONE_REMOTE%:*}"      # gdrive-user
+    remote_name="${remote_only}"           # may already be bare
+    local folder_id
+    folder_id=$(rclone config show "$remote_name" 2>/dev/null | awk -F '=' '$1 ~ /root_folder_id/ { gsub(/[[:space:]]/, "", $2); print $2 }')
+    if [[ -n "$folder_id" ]]; then
+        echo "https://drive.google.com/drive/folders/$folder_id"
+    else
+        log WARN "Could not find root_folder_id for remote '$remote_name'"
+        echo ""
+    fi
+}
+
+################################################################################
+# upload_backup_rclone()
+# Description:
+#   Upload the archive, its checksum, and backup_summary.md to rclone remote,
+#   then prune remote old files.
+#
+# Returns:
+#   0 on success; non-zero if upload failed (prune still attempted).
+################################################################################
+upload_backup_rclone() {
+    require_cmd rclone || { log ERROR "rclone is required for uploads"; return 1; }
+    local ret=0
+    if [[ -z "${RCLONE_REMOTE:-}" ]]; then
+        UPLOAD_STATUS="SKIPPED"
+        log INFO "Rclone remote not set; skipping upload."
+        return 0
+    fi
+
+    # Ensure one trailing colon
+    local REMOTE="${RCLONE_REMOTE%:}:"
+    log INFO "Uploading backup files to: $REMOTE"
+
+    if  rclone copyto "$BACKUP_DIR/$BACKUP_FILE" "$REMOTE/$BACKUP_FILE" "${RCLONE_FLAGS[@]}" \
+        && rclone copyto "$BACKUP_DIR/$BACKUP_FILE.sha256" "$REMOTE/$BACKUP_FILE.sha256" "${RCLONE_FLAGS[@]}" \
+        && rclone copyto "$BACKUP_DIR/backup_summary.md" "$REMOTE/backup_summary.md" "${RCLONE_FLAGS[@]}"; then
+        UPLOAD_STATUS="SUCCESS"
+        log INFO "Uploaded archive, checksum and summary successfully."
+        ret=0
+    else
+        UPLOAD_STATUS="FAIL"
+        log ERROR "One or more uploads failed."
+        ret=1
+    fi
+
+    # Prune older than retention window (only .tar.gz and .sha256)
+    log INFO "Pruning remote archives older than ${DAYS_TO_KEEP} days"
+    local tmpfilter; tmpfilter="$(mktemp)"
+    printf "%s\n" "+ n8n_backup_*.tar.gz" "+ n8n_backup_*.tar.gz.sha256" "- *" > "$tmpfilter"
+    rclone delete "$REMOTE" --min-age "${DAYS_TO_KEEP}d" --filter-from "$tmpfilter" --rmdirs \
+        || log WARN "Remote prune returned non-zero (continuing)."
+    rm -f "$tmpfilter"
+    return $ret
 }
 
 ################################################################################
@@ -761,10 +846,11 @@ do_local_backup() {
 ################################################################################
 # send_mail_on_action()
 # Description:
-#   Decide whether and what to email based on BACKUP_STATUS.
+#   Decide whether and what to email based on BACKUP_STATUS/UPLOAD_STATUS.
 ################################################################################
 send_mail_on_action() {
     local subject body
+
     if [[ "$ACTION" == "Restore" ]]; then
         if [[ "$BACKUP_STATUS" == "FAIL" ]]; then
             subject="$DATE: n8n Restore FAILED"
@@ -782,25 +868,58 @@ Log File: $LOG_FILE"
         return 0
     fi
 
-    # Backup
+    # Backup email decisions (with upload status)
     if [[ "$BACKUP_STATUS" == "FAIL" ]]; then
         subject="$DATE: n8n Backup FAILED locally"
         body="An error occurred during the local backup step. See attached log.
 
 Log File: $LOG_FILE"
         send_email "$subject" "$body" "$LOG_FILE"
-    elif [[ "$BACKUP_STATUS" == "SKIPPED" && "$NOTIFY_ON_SUCCESS" == true ]]; then
-        subject="$DATE: n8n Backup SKIPPED: no changes"
-        body="No changes detected since the last backup; nothing to do."
-        send_email "$subject" "$body"
-    elif [[ "$BACKUP_STATUS" == "SUCCESS" && "$NOTIFY_ON_SUCCESS" == true ]]; then
-        subject="$DATE: n8n Backup SUCCESS"
-        body="Backup completed successfully.
 
-File: $BACKUP_FILE
+    elif [[ "$BACKUP_STATUS" == "SKIPPED" ]]; then
+        if [[ "$NOTIFY_ON_SUCCESS" == true ]]; then
+            subject="$DATE: n8n Backup SKIPPED: no changes"
+            body="No changes detected since the last backup; nothing to do."
+            send_email "$subject" "$body"
+        fi
 
-Log File: $LOG_FILE"
-        send_email "$subject" "$body" "$LOG_FILE"
+    elif [[ "$BACKUP_STATUS" == "SUCCESS" ]]; then
+        # Upload-dependent subject/body
+        if [[ "$UPLOAD_STATUS" == "FAIL" ]]; then
+            subject="$DATE: n8n Backup Succeeded; upload FAILED"
+            body="Local backup succeeded as:
+
+  File: $BACKUP_FILE
+
+But the upload to ${RCLONE_REMOTE:-<unset>} failed.
+See log for details:
+
+  Log File: $LOG_FILE"
+            send_email "$subject" "$body" "$LOG_FILE"
+
+        elif [[ "$UPLOAD_STATUS" == "SUCCESS" ]]; then
+            if [[ "$NOTIFY_ON_SUCCESS" == true ]]; then
+                subject="$DATE: n8n Backup SUCCESS"
+                body="Backup and upload completed successfully.
+
+  File: $BACKUP_FILE
+  Remote: ${RCLONE_REMOTE:-<unset>}
+  Drive Link: ${DRIVE_LINK:-N/A}"
+                send_email "$subject" "$body" "$LOG_FILE"
+            fi
+
+        else # SKIPPED
+            if [[ "$NOTIFY_ON_SUCCESS" == true ]]; then
+                subject="$DATE: n8n Backup SUCCESS (upload skipped)"
+                body="Local backup completed successfully.
+
+  File: $BACKUP_FILE
+  Remote upload: SKIPPED (no rclone remote configured)
+
+  Log File: $LOG_FILE"
+                send_email "$subject" "$body" "$LOG_FILE"
+            fi
+        fi
     fi
 }
 
@@ -834,6 +953,18 @@ print_backup_summary() {
     box_line "N8N Version:"     "$N8N_VERSION"
     box_line "Log File:"        "$LOG_FILE"
     box_line "Daily tracking:"  "$summary_file"
+    case "$UPLOAD_STATUS" in
+        "SUCCESS")
+            box_line "Google Drive upload:" "SUCCESS"
+            box_line "Folder link:"         "${DRIVE_LINK:-N/A}"
+            ;;
+        "SKIPPED")
+            box_line "Google Drive upload:" "SKIPPED"
+            ;;
+        "FAIL"|*)
+            [[ -n "$UPLOAD_STATUS" ]] && box_line "Google Drive upload:" "FAILED"
+            ;;
+    esac
     if [[ -n "$email_reason" ]]; then
         box_line "Email notification:" "$email_status $email_reason"
     else
@@ -845,12 +976,12 @@ print_backup_summary() {
 ################################################################################
 # backup_n8n()
 # Description:
-#   Orchestrate a full backup: change check → local backup → email → summary.
+#   Orchestrate a full backup: change check → local backup → upload → email/summary.
 ################################################################################
 backup_n8n() {
     ACTION="Backup"
     N8N_VERSION="$(get_current_n8n_version)"
-    BACKUP_STATUS=""; BACKUP_FILE=""
+    BACKUP_STATUS=""; UPLOAD_STATUS="SKIPPED"; BACKUP_FILE=""; DRIVE_LINK=""
 
     if is_system_changed; then
         ACTION="Backup (normal)"
@@ -866,6 +997,7 @@ backup_n8n() {
         return 0
     fi
 
+    # Local backup
     if do_local_backup; then
         BACKUP_STATUS="SUCCESS"
         log INFO "Local backup succeeded: $BACKUP_FILE"
@@ -873,24 +1005,79 @@ backup_n8n() {
     else
         BACKUP_STATUS="FAIL"
         log ERROR "Local backup failed."
+        UPLOAD_STATUS="SKIPPED"
         write_summary "$ACTION" "$BACKUP_STATUS"
         send_mail_on_action
         print_backup_summary
         return 1
     fi
 
+    # Remote upload (if configured)
+    if [[ -n "$RCLONE_REMOTE" ]]; then
+        if upload_backup_rclone; then
+            DRIVE_LINK="$(get_google_drive_link)"
+        fi
+    else
+        UPLOAD_STATUS="SKIPPED"
+    fi
+
+    # Record in rolling summary
     write_summary "$ACTION" "$BACKUP_STATUS"
+    # Final notifications & console box
     send_mail_on_action
     print_backup_summary
 }
 
 ################################################################################
+# fetch_restore_archive_if_remote()
+# Description:
+#   If TARGET_RESTORE_FILE is an rclone path, download it locally and verify checksum.
+#
+# Returns:
+#   0 on success; non-zero on download/verification failure.
+################################################################################
+fetch_restore_archive_if_remote() {
+    if [[ -f "$TARGET_RESTORE_FILE" ]]; then
+        return 0
+    fi
+    # Heuristic: contains ':' and not an absolute path -> treat as remote:path
+    if [[ "$TARGET_RESTORE_FILE" == *:* && "$TARGET_RESTORE_FILE" != /* ]]; then
+        require_cmd rclone || { log ERROR "rclone required to fetch remote backup."; return 1; }
+        local tmp_dir="$BACKUP_DIR/_restore_tmp"
+        mkdir -p "$tmp_dir"
+        local base; base="$(basename "$TARGET_RESTORE_FILE" | tr ':' '_')"
+        local local_path="$tmp_dir/$base"
+
+        log INFO "Fetching backup from remote: $TARGET_RESTORE_FILE"
+        if rclone copyto "$TARGET_RESTORE_FILE" "$local_path" "${RCLONE_FLAGS[@]}"; then
+            log INFO "Downloaded to: $local_path"
+            log INFO "Verifying checksum (if present)…"
+            if rclone copyto "${TARGET_RESTORE_FILE}.sha256" "${local_path}.sha256" "${RCLONE_FLAGS[@]}"; then
+                (cd "$tmp_dir" && sha256sum -c "$(basename "${local_path}.sha256")") \
+                    || { log ERROR "Checksum verification failed for $local_path"; return 1; }
+                log INFO "Checksum verified."
+            else
+                log WARN "No remote checksum found; skipping verification."
+            fi
+            TARGET_RESTORE_FILE="$local_path"
+            echo "$TARGET_RESTORE_FILE" > "$tmp_dir/.last_fetched"
+        else
+            log ERROR "Failed to fetch remote backup."
+            return 1
+        fi
+    fi
+}
+
+################################################################################
 # restore_n8n()
 # Description:
-#   Restore the n8n stack from a local backup archive.
+#   Restore the n8n stack from a (local or remote-fetched) backup archive.
 ################################################################################
 restore_n8n() {
     ACTION="Restore"
+    # If remote, fetch locally first
+    fetch_restore_archive_if_remote || { log ERROR "Failed to fetch restore archive."; return 1; }
+
     [[ -f "$TARGET_RESTORE_FILE" ]] || { log ERROR "Restore file not found: $TARGET_RESTORE_FILE"; return 1; }
 
     log INFO "Starting restore at $DATE…"
@@ -905,7 +1092,7 @@ restore_n8n() {
     local backup_compose_path="$restore_dir/docker-compose.yml.bak"
     local current_compose_path="$N8N_DIR/docker-compose.yml"
 
-    [[ -f "$backup_env_path" ]]     || { log ERROR "Missing $backup_env_path"; return 1; }
+    [[ -f "$backup_env_path"     ]] || { log ERROR "Missing $backup_env_path"; return 1; }
     [[ -f "$backup_compose_path" ]] || { log ERROR "Missing $backup_compose_path"; return 1; }
 
     local n8n_encryption_key
@@ -988,6 +1175,10 @@ restore_n8n() {
     check_services_up_running || { log ERROR "Stack unhealthy after restore"; return 1; }
 
     rm -rf "$restore_dir"
+    if [[ -d "$BACKUP_DIR/_restore_tmp" ]]; then
+        find "$BACKUP_DIR/_restore_tmp" -type f -name '*n8n_backup_*.tar.gz' -delete || true
+        rmdir "$BACKUP_DIR/_restore_tmp" 2>/dev/null || true
+    fi
 
     N8N_VERSION="$(get_current_n8n_version)"
     local restored_list=""
@@ -1019,8 +1210,11 @@ restore_n8n() {
 }
 
 # ------------------------------ Arg parsing ----------------------------------
+################################################################################
+# Parse command-line arguments
+################################################################################
 SHORT="i:u:v:m:fcabd:l:her:n"
-LONG="install:,upgrade:,version:,email:,force,cleanup,available,backup,dir:,log-level:,help,restore:,notify-on-success"
+LONG="install:,upgrade:,version:,email:,force,cleanup,available,backup,dir:,log-level:,help,restore:,notify-on-success,remote-name:"
 PARSED=$(getopt --options="$SHORT" --longoptions="$LONG" --name "$0" -- "$@") || usage
 eval set -- "$PARSED"
 
@@ -1039,6 +1233,7 @@ while true; do
         -l|--log-level) LOG_LEVEL="${2^^}"; shift 2;;
         -e|--email)    EMAIL_TO="$2"; EMAIL_EXPLICIT=true; shift 2;;
         -n|--notify-on-success) NOTIFY_ON_SUCCESS=true; shift;;
+        -s|--remote-name) RCLONE_REMOTE="$2"; shift 2;;
         -h|--help)     usage;;
         --) shift; break;;
         *) usage;;
@@ -1139,6 +1334,7 @@ elif [[ $DO_BACKUP == true ]]; then
     require_cmd awk    || exit 1
     require_cmd sha256sum || exit 1
     $EMAIL_EXPLICIT && require_cmd msmtp || true
+    [[ -n "$RCLONE_REMOTE" ]] && require_cmd rclone || true
     backup_n8n || exit 1
     # local cleanups
     find "$BACKUP_DIR/snapshot/volumes" -type d -empty -delete || true
@@ -1153,6 +1349,10 @@ elif [[ $DO_RESTORE == true ]]; then
     require_cmd curl   || exit 1
     require_cmd openssl|| exit 1
     require_cmd awk    || exit 1
+    # Require rclone if TARGET_RESTORE_FILE looks like remote:path
+    if [[ "$TARGET_RESTORE_FILE" == *:* && "$TARGET_RESTORE_FILE" != /* ]]; then
+        require_cmd rclone || exit 1
+    fi
     $EMAIL_EXPLICIT && require_cmd msmtp || true
     restore_n8n || exit 1
 else
